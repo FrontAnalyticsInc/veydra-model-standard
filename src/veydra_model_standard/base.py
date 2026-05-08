@@ -556,7 +556,8 @@ class SimulationContext:
                  intervention_start_time: Optional[float] = None,
                  scenario_param_keys: Optional[set] = None,
                  calibration_params: Optional[Dict[str, Any]] = None,
-                 param_defaults: Optional[Dict[str, Any]] = None):
+                 param_defaults: Optional[Dict[str, Any]] = None,
+                 **kwargs):  # Accept unknown kwargs for backward compat with older generated models
         self.current_time = current_time
         self.current_datetime = current_datetime
         self.all_params = all_params
