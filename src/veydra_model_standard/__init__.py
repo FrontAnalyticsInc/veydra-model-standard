@@ -11,6 +11,11 @@ from .base import (
     build_stacked_table,
     apply_time_window,
 )
+from .expressions import (
+    compile_expression,
+    evaluate_expression,
+    UnsafeExpressionError,
+)
 
 __version__ = "1.1.0"
 __all__ = [
@@ -23,4 +28,7 @@ __all__ = [
     "build_summary_table",
     "build_stacked_table",
     "apply_time_window",
+    "compile_expression",
+    "evaluate_expression",
+    "UnsafeExpressionError",
 ]

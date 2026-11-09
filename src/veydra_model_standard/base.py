@@ -15,6 +15,13 @@ import json
 from typing import Dict, Any, Optional, List, Tuple
 from datetime import datetime
 
+from functools import lru_cache
+
+from .expressions import compile_expression, UnsafeExpressionError
+
+# SimulationContext is rebuilt every solver step; share compiled expressions.
+_compile_expression_cached = lru_cache(maxsize=512)(compile_expression)
+
 
 # ---------------------------------------------------------------------------
 # Meta-keys stripped from input before parameter resolution
@@ -663,21 +670,10 @@ class SimulationContext:
         if not expression:
             return spec.get('defaultValue', 0.0)
         
-        if key not in self._dynamic_cache:
-            self._dynamic_cache[key] = {
-                'code': compile(expression, f'<param:{key}>', 'eval'),
-                'math_ns': {
-                    'sin': math.sin, 'cos': math.cos, 'tan': math.tan,
-                    'exp': math.exp, 'log': math.log, 'sqrt': math.sqrt,
-                    'abs': abs, 'min': min, 'max': max, 'pow': pow,
-                    'pi': math.pi, 'e': math.e,
-                    'floor': math.floor, 'ceil': math.ceil,
-                }
-            }
-        
-        cached = self._dynamic_cache[key]
-        return float(eval(cached['code'], {'__builtins__': {}}, 
-                         {**cached['math_ns'], 't': t}))
+        # Validated, whitelisted evaluation -- never a raw eval() of user input.
+        # Raises UnsafeExpressionError/SyntaxError for rejected expressions;
+        # _resolve_dynamic_param then falls back to defaultValue.
+        return _compile_expression_cached(expression)(t)
     
     @staticmethod
     def _interpolate_points(points, t: float):
