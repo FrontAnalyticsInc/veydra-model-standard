@@ -7,6 +7,7 @@ Provides the core infrastructure for building system dynamics models:
 - Summary/stacked output helpers for multi-scenario execution
 """
 
+import contextvars
 import math
 import numpy as np
 from scipy.integrate import solve_ivp
@@ -30,6 +31,13 @@ META_KEYS = frozenset([
 ])
 
 DEFAULT_SUMMARY_STATS = ['final_value', 'peak', 'min', 'mean', 'growth_pct']
+
+# Scenario gating context for the run currently in progress. Set by
+# run_multi_scenario around each run_simulation call and read by
+# SimulationContext when the model does not pass gating kwargs explicitly
+# (generated models construct SimulationContext without them).
+_ACTIVE_SCENARIO_CONTEXT: contextvars.ContextVar = contextvars.ContextVar(
+    'veydra_active_scenario_context', default=None)
 
 
 # ---------------------------------------------------------------------------
@@ -368,6 +376,22 @@ class VeydraModelStandard:
     # ------------------------------------------------------------------
     # Multi-scenario execution
     # ------------------------------------------------------------------
+    def _run_with_scenario_context(self, params: Dict[str, Any],
+                                   scenario_context: Optional[dict]) -> dict:
+        """Run one simulation with scenario gating active for its duration.
+
+        Every SimulationContext created during the run picks up the gating
+        context, even when the model constructs it without gating kwargs.
+        The context is always cleared afterwards, including on error.
+        """
+        token = _ACTIVE_SCENARIO_CONTEXT.set(scenario_context)
+        self._scenario_context = scenario_context  # kept for introspection
+        try:
+            return self.run_simulation(params)
+        finally:
+            _ACTIVE_SCENARIO_CONTEXT.reset(token)
+            self._scenario_context = None
+
     def run_multi_scenario(self, config: Dict[str, Any]) -> dict:
         """Run one or many scenarios in a single call with shared calibration.
         
@@ -393,7 +417,7 @@ class VeydraModelStandard:
         """
         # ---- extract meta-keys ----
         include_baseline = config.get('include_baseline', False)
-        calibration_params = config.get('__calibration_params__', {})
+        calibration_params = self._clean_params(config.get('__calibration_params__') or {})
         initial_state = config.get('__initial_state__', {})
         time_window = config.get('__time_window__', None)
         output_format = config.get('__output_format__', 'full')
@@ -436,9 +460,7 @@ class VeydraModelStandard:
             if initial_state:
                 baseline_params['__initial_state__'] = initial_state
             
-            # Clear scenario context so SimulationContext uses plain params
-            self._scenario_context = None
-            baseline_result = self.run_simulation(baseline_params)
+            baseline_result = self._run_with_scenario_context(baseline_params, None)
             if time_window and baseline_result.get('success'):
                 baseline_result = apply_time_window(baseline_result, time_window)
             scenario_results['baseline'] = baseline_result
@@ -457,8 +479,13 @@ class VeydraModelStandard:
             scenario_id = scenario_def.get('id', f'scenario_{len(scenario_results)}')
             scenario_params = scenario_def.get('params', {})
             
-            # Build merged params: simulation config + scenario overrides
+            # Build merged params: simulation config + calibration + scenario overrides.
+            # Calibration applies to the whole run for every parameter the
+            # scenario does not override, so scenarios share the baseline's
+            # calibration; overridden keys get calibration pre-intervention
+            # via gating below.
             merged = dict(sim_params)
+            merged.update(calibration_params)
             merged.update(scenario_params)
             if initial_state:
                 merged['__initial_state__'] = initial_state
@@ -479,22 +506,19 @@ class VeydraModelStandard:
                 except Exception:
                     pass
                 
-                self._scenario_context = {
+                scenario_context = {
                     'intervention_start_time': intervention_start,
                     'scenario_params': override_keys,
                     'calibration_params': calibration_params,
                     'param_defaults': param_defaults,
                 }
             else:
-                self._scenario_context = None
+                scenario_context = None
             
-            result = self.run_simulation(merged)
+            result = self._run_with_scenario_context(merged, scenario_context)
             if time_window and result.get('success'):
                 result = apply_time_window(result, time_window)
             scenario_results[scenario_id] = result
-        
-        # Clear scenario context after batch
-        self._scenario_context = None
         
         # ---- determine primary stock for summary ----
         primary_stock = summary_variable
@@ -564,7 +588,18 @@ class SimulationContext:
         self.all_stocks = all_stocks
         self.intervention_active = intervention_active
         
-        # Scenario context for native intervention gating
+        # Scenario context for native intervention gating. When the caller
+        # passes none of the gating kwargs, fall back to the context of the
+        # run_multi_scenario run in progress (if any).
+        if (intervention_start_time is None and scenario_param_keys is None
+                and calibration_params is None and param_defaults is None):
+            active = _ACTIVE_SCENARIO_CONTEXT.get()
+            if active:
+                intervention_start_time = active.get('intervention_start_time')
+                scenario_param_keys = active.get('scenario_params')
+                calibration_params = active.get('calibration_params')
+                param_defaults = active.get('param_defaults')
+
         self.intervention_start_time = intervention_start_time
         self.scenario_param_keys = scenario_param_keys or set()
         self.calibration_params = calibration_params or {}
